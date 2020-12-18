@@ -29,6 +29,7 @@ def preprocessing(row):
             seqs.append(' '.join(row.toks[j*Constants.SLIDING_DIST:(j+1)*Constants.SLIDING_DIST+(Constants.MAX_SEQ_LEN - Constants.SLIDING_DIST-2)]))
     return seqs
 
+# df = pd.read_hdf(args.processed_df.resolve(), key='df')
 df = pd.read_pickle(args.processed_df.resolve())
 df['seqs'] = df.apply(preprocessing, axis = 1)
 df['num_seqs'] = df.seqs.apply(len)
@@ -146,8 +147,8 @@ kf = KFold(n_splits = 10, shuffle = True, random_state = 42)
 for c,j in enumerate(kf.split(subjects, groups = subjects['inhosp_mort'])):
     for k in j[1]:
         t2.loc[t2['subject_id'] == subjects.loc[k]['subject_id'], 'fold'] = str(c+1)
+# t2.to_hdf(args.output_dir / 'inhosp_mort', key='df')
 t2.to_pickle(args.output_dir / 'inhosp_mort')
-
 
 '''
 Phenotyping using all patient notes
@@ -214,6 +215,7 @@ for c,j in enumerate(kf.split(subjects, groups = subjects['any_disease'])):
     for k in j[1]:
         t3.loc[t3['subject_id'] == subjects.loc[k]['subject_id'], 'fold'] = str(c+1)
 
+# t3.to_hdf(args.output_dir / 'phenotype_all', key='df')
 t3.to_pickle(args.output_dir / 'phenotype_all')
 
 '''
@@ -274,4 +276,6 @@ kf = KFold(n_splits = 10, shuffle = True, random_state = 42)
 for c,j in enumerate(kf.split(subjects, groups = subjects['any_disease'])):
     for k in j[1]:
         t4.loc[t4['subject_id'] == subjects.loc[k]['subject_id'], 'fold'] = str(c+1)
+# t4.to_hdf(args.output_dir / 'phenotype_first', key='df')
+t4.to_pickle(args.output_dir / 'phenotype_first')
 t4.to_pickle(args.output_dir / 'phenotype_first')

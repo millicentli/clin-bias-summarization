@@ -10,7 +10,8 @@ from pathlib import Path
 output_folder = Path(sys.argv[1])
 output_folder.mkdir(parents = True, exist_ok = True)
 
-conn = psycopg2.connect('dbname=mimic user=haoran host=mimic password=password')
+# conn = psycopg2.connect('dbname=mimic user=haoran host=mimic password=password')
+conn = psycopg2.connect('dbname=mimic user=millicent@mimiciii host=mimiciii.postgres.database.azure.com password=asdfasdf1!')
 
 pats = pd.read_sql_query('''
 select subject_id, gender, dob, dod from mimiciii.patients
@@ -79,7 +80,7 @@ df = df[df.chartdate >= df.dob]
 
 ages = []
 for i in range(df.shape[0]):
-    ages.append((df.chartdate.iloc[i] - df.dob.iloc[i]).days/365.24)
+    ages.append((df.chartdate.iloc[i].to_pydatetime() - df.dob.iloc[i].to_pydatetime()).days/365.24)
 df['age'] = ages
 
 df.loc[(df.category == 'Discharge summary') |
@@ -121,7 +122,22 @@ from mimiciii.icustays
 ''', conn).set_index(['subject_id','hadm_id'])
 
 def fill_icustay(row):
-    opts = icustays.loc[[row['subject_id'],row['hadm_id']]]
+    # print("here's row:", row)
+    # print("here's row['subject_id']:", row['subject_id'])
+    # print("here's row['hadm_id']", int(row['hadm_id']))
+    # print("here's icustays:", icustays)
+    # print("here's icustays type:", type(icustays))
+    # print("here are the column names:", icustays.columns)
+    # found = icustays.loc[(row['subject_id'], int(row['hadm_id']))].contains(int(row['hadm_id']))
+    # found = 
+    # print("here's icustays.index:", icustays.index)
+    arr = [[row['subject_id']], [row['hadm_id']]]
+    if (~pd.MultiIndex.from_arrays(arr).isin(icustays.index)):
+    # if len(found) == 0:
+        #print("skipping cuz broke id", row['hadm_id'])
+        return None
+    opts = icustays.loc[(row['subject_id'],int(row['hadm_id']))]
+    # opts = icustays.loc[(268, 110404)]
     if pd.isnull(row['charttime']):
         charttime = row['chartdate'] + pd.Timedelta(days = 2)
     else:

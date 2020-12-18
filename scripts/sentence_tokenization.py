@@ -5,7 +5,9 @@ sys.path.append(os.getcwd())
 import pandas as pd
 import numpy as np
 import pickle
-from pytorch_pretrained_bert import BertTokenizer, BertModel
+# from pytorch_pretrained_bert import BertTokenizer, BertModel
+# from transformers import BartTokenizer, BartModel
+from transformers import AutoTokenizer, AutoModel
 import argparse
 import spacy
 import re
@@ -17,8 +19,11 @@ parser.add_argument('output_loc', help = "path to output the dataframe", type=st
 parser.add_argument("model_path", help = 'folder with trained BERT model and tokenizer', type=str)
 args = parser.parse_args()
 
-tokenizer = BertTokenizer.from_pretrained(args.model_path)
-model = BertModel.from_pretrained(args.model_path)
+print("here's the model path:", args.model_path)
+# tokenizer = BartTokenizer.from_pretrained(args.model_path, local_files_only=False)
+# model = BartModel.from_pretrained(args.model_path, local_files_only=False)
+tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+model = AutoModel.from_pretrained(args.model_path)
 
 df = pd.read_pickle(args.input_loc)
 
@@ -181,4 +186,5 @@ def drop_bad_sents(x):
 df2 = df.loc[df.sent_toks_lens.apply(lambda x: sum([i == 0 for i in x])) > 0]
 df2.apply(drop_bad_sents, axis = 1) #modifies sentence list in place
 
+# df.to_hdf(args.output_loc, key='df')
 df.to_pickle(args.output_loc)

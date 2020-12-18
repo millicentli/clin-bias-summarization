@@ -10,6 +10,7 @@ import shelve
 
 from random import random, randrange, randint, shuffle, choice
 from pytorch_pretrained_bert.tokenization import BertTokenizer
+# from transformers import BartTokenizer
 import numpy as np
 import json
 import collections
@@ -429,7 +430,9 @@ def main():
 
     args = parser.parse_args()
 
+    #df = pd.read_hdf(args.train_df, key='df')
     df = pd.read_pickle(args.train_df)
+
 
     if len(args.categories) > 0:
         for i in args.categories:

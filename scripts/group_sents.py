@@ -1,7 +1,8 @@
 #!/h/haoran/anaconda3/bin/python
 import pandas as pd
 import numpy as np
-from pytorch_pretrained_bert.tokenization import BertTokenizer
+# from pytorch_pretrained_bert.tokenization import BertTokenizer
+from transformers import BartTokenizer, AutoTokenizer
 import random
 import argparse
 
@@ -15,8 +16,9 @@ parser.add_argument('-m','--minlen', help = 'minimum lengths of tokens to pack t
                      type=int,  dest='minlen', default = [20])
 args = parser.parse_args()
 
-tokenizer = BertTokenizer.from_pretrained(args.model_path, do_lower_case = True)
+tokenizer = AutoTokenizer.from_pretrained(args.model_path, do_lower_case = True)
 
+# df = pd.read_hdf(args.input_loc, key='df')
 df = pd.read_pickle(args.input_loc)
 
 def pack_sentences(row, minlen):
@@ -45,4 +47,5 @@ for i in args.minlen:
 	df['num_BERT_sents'+str(i)] = df['BERT_sents'+str(i)].apply(len)
 	assert(all(df['BERT_sents_lens'+str(i)].apply(sum) == df['sent_toks_lens'].apply(sum)))
 
+# df.to_hdf(args.output_loc, key='df')
 df.to_pickle(args.output_loc)
