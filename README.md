@@ -1,4 +1,5 @@
-# Hurtful Words: Quantifying Biases in Clinical Contextual Word Embeddings
+# Clinical Bias in Summarization Models
+# _Forked from 'Hurtful Words: Quantifying Biases in Clinical Contextual Word Embeddings'_
 
 ## Paper
 If you use this code in your research, please cite the following [publication](https://dl.acm.org/doi/abs/10.1145/3368555.3384448):
