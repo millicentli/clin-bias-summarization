@@ -435,11 +435,11 @@ def convert_examples_to_features(examples, max_seq_length,
         # For classification tasks, the first vector (corresponding to [CLS]) is
         # used as as the "sentence vector". Note that this only makes sense because
         # the entire model is fine-tuned.
-        tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
+        tokens = ["<s>"] + tokens_a + ["</s>"]
         segment_ids = [0] * len(tokens)
 
         if tokens_b:
-            tokens += tokens_b + ["[SEP]"]
+            tokens += tokens_b + ["</s>"]
             segment_ids += [1] * (len(tokens_b) + 1)
 
         input_ids = tokenizer.convert_tokens_to_ids(tokens)

@@ -14,12 +14,13 @@ from pytorch_pretrained_bert import BertTokenizer, BertModel
 from run_classifier_dataset_utils import InputExample, convert_examples_to_features
 from pathlib import Path
 from tqdm import tqdm
-from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+# from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+from transformers import BartTokenizer, BartForConditionalGeneration, AdamW
 from gradient_reversal import GradientReversal
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, log_loss, mean_squared_error, classification_report
 import random
 import json
-from pytorch_pretrained_bert.file_utils import WEIGHTS_NAME, CONFIG_NAME
+#from pytorch_pretrained_bert.file_utils import WEIGHTS_NAME, CONFIG_NAME
 from utils import create_hdf_key, Classifier, get_emb_size, MIMICDataset, extract_embeddings, EarlyStopping, load_checkpoint
 from sklearn.model_selection import ParameterGrid
 
@@ -30,11 +31,11 @@ parser.add_argument("--model_path", type=str)
 parser.add_argument('--fold_id', help = 'what fold to use as the DEV fold. Dataframe must have a "fold" column',nargs = '+', type=str, dest = 'fold_id', default = [])
 parser.add_argument('--target_col_name', help = 'name of target to train on. Must be a column in the dataframe', type=str)
 parser.add_argument("--output_dir", help = 'folder to output model/results', type=str)
-parser.add_argument('--use_adversary', help = "whether or not to use an adversary. If True, must not have --freeze_bert", action = 'store_true')
+parser.add_argument('--use_adversary', help = "whether or not to use an adversary. If True, must not have --freeze_bart", action = 'store_true')
 parser.add_argument('--lm', help = 'lambda value for the adversary', type = float, default = 1.0)
 parser.add_argument('--protected_group', help = 'name of protected group, must be a column in the dataframe', type = str, default = 'insurance')
 parser.add_argument('--adv_layers', help = 'number of layers in adversary', type = int, default = 2)
-parser.add_argument('--freeze_bert', help = 'freeze all BERT layers and only use pre-trained representation', action = 'store_true')
+parser.add_argument('--freeze_bart', help = 'freeze all BERT layers and only use pre-trained representation', action = 'store_true')
 parser.add_argument('--train_batch_size', help = 'batch size to use for training', type = int)
 parser.add_argument('--max_num_epochs', help = 'maximum number of epochs to train for', type = int, default = 20)
 parser.add_argument('--es_patience', help = 'patience for the early stopping', type = int, default = 3)
@@ -53,7 +54,7 @@ parser.add_argument('--average', help = 'whether to aggregate sequences to a sin
 parser.add_argument('--gridsearch_c', help = 'whether to run a grid search over the NYU agg c parameter, using AUPRC as metric, only valid if not --average, and --gridsearch_classifier', action = 'store_true')
 parser.add_argument('--use_new_mapping', help = 'whether to use new mapping for adversarial training', action = 'store_true')
 parser.add_argument('--pregen_emb_path', help = '''if embeddings have been precomputed, can provide a path here (as a pickled dictionary mapping note_id:numpy array).
-                        Will only be used if freeze_bert. note_ids in this dictionary must a be a superset of the note_ids in df_path''', type = str)
+                        Will only be used if freeze_bart. note_ids in this dictionary must a be a superset of the note_ids in df_path''', type = str)
 parser.add_argument('--overwrite', help = 'whether to overwrite existing model/predictions', action = 'store_true')
 args = parser.parse_args()
 
@@ -66,8 +67,8 @@ df = pd.read_pickle(args.df_path)
 if 'note_id' in df.columns:
     df = df.set_index('note_id')
 
-tokenizer = BertTokenizer.from_pretrained(args.model_path)
-model = BertModel.from_pretrained(args.model_path)
+tokenizer = BartTokenizer.from_pretrained(args.model_path)
+model = BartForConditionalGeneration.from_pretrained(args.model_path)
 
 target = args.target_col_name
 assert(target in df.columns)
@@ -84,7 +85,7 @@ if args.use_adversary:
         mapping = Constants.mapping
 
 other_fields_to_include = args.other_fields
-if args.freeze_bert:
+if args.freeze_bart:
     for param in model.parameters():
         param.requires_grad = False
 
@@ -190,7 +191,7 @@ class Discriminator(nn.Module):
         return x
 
 if args.gridsearch_classifier:
-    assert(args.freeze_bert)
+    assert(args.freeze_bart)
     grid = list(ParameterGrid({
         'num_layers': [2,3,4],
         'dropout_prob': [0, 0.2],
@@ -291,7 +292,7 @@ if not args.pregen_emb_path:
     test_set = MIMICDataset(features_test, 'test', args.task_type)
     test_generator = data.DataLoader(test_set, shuffle = False,  batch_size = args.train_batch_size)
 
-if args.freeze_bert: #only need to precalculate for training and val set
+if args.freeze_bart: #only need to precalculate for training and val set
     if args.pregen_emb_path:
         pregen_embs = pickle.load(open(args.pregen_emb_path, 'rb'))
         features_train_embs = convert_examples_to_features_emb(examples_train, pregen_embs)
@@ -415,32 +416,38 @@ for predictor_params in grid:
     if n_gpu > 1:
         predictor = torch.nn.DataParallel(predictor)
 
-    if not(args.freeze_bert) and not(args.use_adversary):
+    if not(args.freeze_bart) and not(args.use_adversary):
         param_optimizer = list(model.named_parameters()) + list(predictor.named_parameters())
-    elif args.freeze_bert and not(args.use_adversary):
+    elif args.freeze_bart and not(args.use_adversary):
         param_optimizer = list(predictor.named_parameters())
-    elif args.freeze_bert and args.use_adversary:
+    elif args.freeze_bart and args.use_adversary:
         raise Exception('No purpose in using an adversary if BERT layers are frozen')
     else:
         param_optimizer = list(model.named_parameters()) + list(predictor.named_parameters()) + list(discriminator.named_parameters())
 
+    '''
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
                 {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
                 {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
                 ]
+    '''
+    params = [p for n,p in model.named_parameters()]
+    optimizer = AdamW(params, lr=args.learning_rate)
 
     es = EarlyStopping(patience = args.es_patience)
 
+    '''
     optimizer = BertAdam(optimizer_grouped_parameters,
                                     lr=learning_rate,
                                     warmup=warmup_proportion,
                                     t_total=num_train_optimization_steps)
     warmup_linear = WarmupLinearSchedule(warmup=warmup_proportion,
                                                  t_total=num_train_optimization_steps)
+    '''
     for epoch in range(1, num_train_epochs+1):
         # training
-        if not args.freeze_bert:
+        if not args.freeze_bart:
             model.train()
         else:
             model.eval()
@@ -450,25 +457,27 @@ for predictor_params in grid:
         running_loss = 0.0
         num_steps = 0
         with tqdm(total=len(training_generator), desc="Epoch %s"%epoch) as pbar:
-            if not args.freeze_bert:
+            if not args.freeze_bart:
                 for input_ids, input_mask, segment_ids, y, group, _, other_vars in training_generator:
                     input_ids = input_ids.to(device)
-                    segment_ids = segment_ids.to(device)
+                    #segment_ids = segment_ids.to(device)
                     input_mask = input_mask.to(device)
                     y = y.to(device)
                     group = group.to(device)
 
-                    hidden_states, _ = model(input_ids, token_type_ids = segment_ids, attention_mask = input_mask)
-                    bert_out = extract_embeddings(hidden_states, args.emb_method)
+                    output = model(input_ids, attention_mask = input_mask)
+                    hidden_states_last = output[2]
+                    hidden_states = output[3]
+                    bart_out = extract_embeddings(hidden_states_last, hidden_states, args.emb_method)
 
                     for i in other_vars:
-                        bert_out = torch.cat([bert_out, i.float().unsqueeze(dim = 1).to(device)], 1)
+                        bart_out = torch.cat([bart_out, i.float().unsqueeze(dim = 1).to(device)], 1)
 
-                    preds = predictor(bert_out)
+                    preds = predictor(bart_out)
                     loss = criterion(preds, y)
 
                     if args.use_adversary:
-                        adv_input = bert_out[:, :-len(other_vars)]
+                        adv_input = bart_out[:, :-len(other_vars)]
                         if args.fairness_def == 'odds':
                             adv_input = torch.cat([adv_input, y.unsqueeze(dim = 1)], 1)
                         adv_pred = discriminator(adv_input)
@@ -519,7 +528,7 @@ for predictor_params in grid:
         predictor.eval()
         val_loss = 0
         with torch.no_grad():
-            if args.freeze_bert:
+            if args.freeze_bart:
                 checkpoints = {PREDICTOR_CHECKPOINT_PATH: predictor}
                 for embs, y, guid, other_vars in val_generator:
                     embs = embs.to(device)
@@ -541,17 +550,20 @@ for predictor_params in grid:
                             MODEL_CHECKPOINT_PATH: model}
                 for input_ids, input_mask, segment_ids, y, group, guid, other_vars in val_generator:
                     input_ids = input_ids.to(device)
-                    segment_ids = segment_ids.to(device)
+                    #segment_ids = segment_ids.to(device)
                     input_mask = input_mask.to(device)
                     y = y.to(device)
                     group = group.to(device)
-                    hidden_states, _ = model(input_ids, token_type_ids = segment_ids, attention_mask = input_mask)
-                    bert_out = extract_embeddings(hidden_states, args.emb_method)
+                    #hidden_states, _ = model(input_ids, token_type_ids = segment_ids, attention_mask = input_mask)
+                    output = model(input_ids, attention_mask = input_mask)
+                    hidden_states_last = output[2]
+                    hidden_states = output[3]
+                    bert_out = extract_embeddings(hidden_states_last, hidden_states, args.emb_method)
 
                     for i in other_vars:
-                        bert_out = torch.cat([bert_out, i.float().unsqueeze(dim = 1).to(device)], 1)
+                        bart_out = torch.cat([bert_out, i.float().unsqueeze(dim = 1).to(device)], 1)
 
-                    preds = predictor(bert_out)
+                    preds = predictor(bart_out)
                     loss = criterion(preds, y)
                     if n_gpu > 1:
                         loss = loss.mean()
@@ -572,13 +584,13 @@ for predictor_params in grid:
     print('Trained for %s epochs' % epoch)
     predictor.load_state_dict(load_checkpoint(PREDICTOR_CHECKPOINT_PATH))
     os.remove(PREDICTOR_CHECKPOINT_PATH)
-    if not args.freeze_bert:
+    if not args.freeze_bart:
         model.load_state_dict(load_checkpoint(MODEL_CHECKPOINT_PATH))
         os.remove(MODEL_CHECKPOINT_PATH)
 
     if args.gridsearch_classifier:
         auprcs = [] #one value for each in c grid
-        prediction_dict, _, _ = evaluate_on_set(val_generator, predictor, emb_gen = args.freeze_bert)
+        prediction_dict, _, _ = evaluate_on_set(val_generator, predictor, emb_gen = args.freeze_bart)
         for c_val in c_grid:
             merged_preds_val = merge_preds(prediction_dict, c_val)
             merged_preds_val_list = [merged_preds_val[str(i)] for i in actual_val.index]
@@ -600,7 +612,7 @@ else:
     opt_c = 2.0
 
 # evaluate on val set
-prediction_dict_val, merged_preds_val, embs_val = evaluate_on_set(val_generator, predictor, emb_gen = args.freeze_bert, c_val = opt_c)
+prediction_dict_val, merged_preds_val, embs_val = evaluate_on_set(val_generator, predictor, emb_gen = args.freeze_bart, c_val = opt_c)
 merged_preds_val_list = [merged_preds_val[str(i)] for i in actual_val.index]
 
 if args.task_type == 'binary':
@@ -619,9 +631,9 @@ elif args.task_type == 'multiclass':
 	report = classification_report(actual_val.values.astype(int), np.array(merged_preds_val_list))
 	print(report)
 
-prediction_dict_test, merged_preds_test, embs_test = evaluate_on_set(test_generator, predictor, emb_gen = args.freeze_bert,  c_val = opt_c)
+prediction_dict_test, merged_preds_test, embs_test = evaluate_on_set(test_generator, predictor, emb_gen = args.freeze_bart,  c_val = opt_c)
 if args.output_train_stats:
-    prediction_dict_train, merged_preds_train, embs_train = evaluate_on_set(training_generator, predictor, emb_gen = args.freeze_bert, c_val = opt_c)
+    prediction_dict_train, merged_preds_train, embs_train = evaluate_on_set(training_generator, predictor, emb_gen = args.freeze_bart, c_val = opt_c)
 else:
     merged_preds_train, embs_train = {}, {}
 
@@ -630,7 +642,7 @@ json.dump(predictor_params, open(os.path.join(args.output_dir, 'predictor_params
 torch.save(predictor.state_dict(), os.path.join(args.output_dir, 'predictor.pt'))
 
 # save model
-if not args.freeze_bert:
+if not args.freeze_bart:
     model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
     output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
     output_config_file = os.path.join(args.output_dir, CONFIG_NAME)

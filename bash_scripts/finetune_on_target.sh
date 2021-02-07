@@ -1,19 +1,13 @@
 #!/bin/bash
-#SBATCH --partition t4 
-#SBATCH --gres gpu:1
-#SBATCH -c 8
-#SBATCH --output=finetune_%A.out
-#SBATCH --mem 60gb
 
 # $1 - target type {inhosp_mort, phenotype_first, phenotype_all}
-# $2 - BERT model name {baseline_clinical_BERT_1_epoch_512, adv_clinical_BERT_1_epoch_512}
+# $2 - BERT model name {baseline_clinical_BART_base, baseline_clinical_BART_FT}
 # $3 - target column name within the dataframe, ex: "Shock", "any_acute"
 
-set -e 
-source activate hurtfulwords
-
-BASE_DIR="/h/haoran/projects/HurtfulWords"
-OUTPUT_DIR="/scratch/hdd001/home/haoran/shared_data/HurtfulWords/data"
+## BASE_DIR="/h/haoran/projects/HurtfulWords"
+BASE_DIR="/gscratch/ark/limill01/clin-bias-summarization"
+## OUTPUT_DIR="/scratch/hdd001/home/haoran/shared_data/HurtfulWords/data"
+OUTPUT_DIR="/gscratch/ark/limill01/clin-bias-summarization/data"
 
 cd "$BASE_DIR/scripts"
 

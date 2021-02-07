@@ -2,10 +2,11 @@ import torch
 import argparse
 import pickle
 import numpy as np
+import spacy
 from pathlib import Path
 from transformers import BartTokenizer
 
-# holds the data
+# Holds the data
 class DocumentDatabase:
     def __init__(self):
         self.documents = []
@@ -23,15 +24,16 @@ class DocumentDatabase:
         self.summaries.append(summary)
         if len(document) > self.doclen:
             self.doclen = len(document)
-        for word in document.split():
-            word = word.lower()
+        #print("Here's document:", document)
+        for word in document:
+            word = word.text.lower()
             if word not in self.dictionary:
                 self.dictionary[word] = self.word_idx
                 self.word_idx += 1
                 self.source_dictionary[word] = self.src_idx
                 self.src_idx += 1
-        for word in summary.split():
-            word = word.lower()
+        for word in summary:
+            word = word.text.lower()
             if word not in self.dictionary:
                 self.dictionary[word] = self.word_idx
                 self.word_idx += 1
@@ -59,14 +61,29 @@ def clean_cxr(filename, database, tokenizer):
         for line in f:
            split = line.split('\t')
            # Question: Do I need to do cls/sep for BART?
+           # doc = cls + split[0] + sep
+           # summary = cls + split[1] + sep
            doc = split[0]
-           doc = cls + doc + sep
            summary = split[1]
            database.add_doc_sum(doc, summary)
 
     return database
 
-# gets the denoising partition
+def apply_scispacy(filename, database, tokenizer):
+    sep = tokenizer.sep_token
+    cls = tokenizer.cls_token
+    nlp = spacy.load('en_core_sci_md', disable=['tagger', 'ner'])
+    with open(filename, 'r') as f:
+        for line in f:
+            split = line.split('\t')
+            #print("Before spacy:", split[0])
+            doc = nlp(split[0].strip())
+            #print("After spacy:", doc)
+            summary = nlp(split[1].strip())
+            database.add_doc_sum(doc, summary)
+
+    return database
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -78,7 +95,7 @@ def main():
 
     tokenizer = BartTokenizer.from_pretrained(args.bart_model, do_lower_case=True)
     database = DocumentDatabase()
-    database = clean_cxr(args.train_df, database, tokenizer)
+    database = apply_scispacy(args.train_df, database, tokenizer)
 
     # Save the database
     f = open(str(args.output_dir) + '/docs.pkl', 'wb')

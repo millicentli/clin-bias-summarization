@@ -154,6 +154,7 @@ def repl(m):
 nlp = spacy.load('en_core_sci_md', disable=['tagger','ner'])
 nlp.add_pipe(sbd_component, before='parser')
 
+
 df['sents'], df['sections'] = zip(*df.text.apply(process_note))
 df['mod_text'] = df['sections'].apply(lambda x: '\n'.join(x))
 
@@ -164,10 +165,19 @@ df['toks'] = tokens
 df['num_toks'] = df.toks.apply(len)
 df = df[(df.num_toks > 0)]
 
+# First Checkpoint
+#df.to_hdf('/gscratch/ark/limill01/clin-bias-summarization/data/test/ckpt1.hdf', 'data', mode='w')
+df.to_pickle('/gscratch/stf/limill01/data/ckpt1.pkl')
+#df = pd.read_pickle('/gscratch/stf/limill01/data/ckpt1.pkl')
+
 def tokenize_sents(x):
     return [len(tokenizer.tokenize(i)) for i in x]
 
 df['sent_toks_lens'] = df['sents'].apply(lambda x: tokenize_sents(x)) #length of each sent
+
+# Second Checkpoint
+# df.to_hdf('/gscratch/ark/limill01/clin-bias-summarization/data/test/ckpt2.hdf', 'data', mode='w')
+df.to_pickle('/gscratch/stf/limill01/data/ckpt2.pkl')
 
 # sentences could be composed of weird characters, that have length >= 1
 # but when tokenized, they are dropped, resulting in empty sentences
@@ -186,5 +196,5 @@ def drop_bad_sents(x):
 df2 = df.loc[df.sent_toks_lens.apply(lambda x: sum([i == 0 for i in x])) > 0]
 df2.apply(drop_bad_sents, axis = 1) #modifies sentence list in place
 
-# df.to_hdf(args.output_loc, key='df')
+# df.to_hdf(args.output_loc, 'data', mode='w')
 df.to_pickle(args.output_loc)

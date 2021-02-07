@@ -32,7 +32,7 @@ cols = ['Acute and unspecified renal failure',
  'any_acute',
  'any_disease']
 
-std_models = ['baseline_clinical_BERT_1_epoch_512', 'adv_clinical_BERT_gender_1_epoch_512']
+std_models = ['baseline_clinical_BART', 'finetuned_clinical_BART']
 
 # file name, col names, models
 tasks = [('inhosp_mort', ['inhosp_mort'],  std_models),
@@ -42,5 +42,6 @@ tasks = [('inhosp_mort', ['inhosp_mort'],  std_models),
 for dfname, targetnames, models in tasks:
     for t in targetnames:
         for c,m in enumerate(models):
-            subprocess.call(shlex.split('sbatch finetune_on_target.sh "%s" "%s" "%s"'%(dfname,m,t)))
+            #subprocess.call(shlex.split('sbatch finetune_on_target.sh "%s" "%s" "%s"'%(dfname,m,t)))
+            subprocess.call(shlex.split('sbatch finetune.slurm "%s" "%s" "%s"' % (dfname, m, t)))
 

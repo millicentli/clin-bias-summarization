@@ -6,64 +6,122 @@ import pickle
 import random
 import collections
 import json
+import json
 import os
 import numpy as np
+import pandas as pd
 
-from torch.utils.data import DataLoader, Dataset, RandomSampler
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler
+from tqdm import tqdm, trange
 from functools import partial
 from pregenerate_train_sums import DocumentDatabase
-from dataset_util import DenoisingDataset, ConvertedDataset, collate
+from dataset_util import ConvertedDataset, PregeneratedDataset, collate
+from datasets import load_metric
 
 from transformers import BartForConditionalGeneration, BartTokenizer, AdamW, get_linear_schedule_with_warmup
 
 log_format = '%(asctime)-10s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
+writer = SummaryWriter()
 
 '''
-taken from https://github.com/pytorch/fairseq/blob/master/fairseq/data/encoders/utils.py with changes
+# Quick evaluation
+def evaluate(model, tokenizer, dataloader, device):
+    logger.info("***** Running evaluation *****")
+
+    total = 0
+    nb_eval_step = 0
+
+    rouge = load_metric('rouge')
+
+    model.eval()
+    for batch in tqdm(test_dataloader):
+        inputs = batch[0].to(device)
+        atten = batch[1].to(device)
+        labels = batch[2].to(device)
+        
+        # Predicted words
+        out_ypred = model.generate(inputs, max_length=20, num_beams=5, length_penalty=2.0, early_stopping=True)
+        words_ypred = tokenizer.decode(out_ypred[0].tolist())
+
+        # Actual words
+        words_label = tokenizer.decode(labels[0].tolist())
+
+        rouge.add(words_ypred, words_label)
+
+    score = rouge.compute(rouge_types["rouge1", "rouge2", "rougeL"])
+
+    df = pd.DataFrame(score)
+    df.columns = ["Rouge1", "Rouge2", "RougeL"]
+
+    # Writing the output of the evaluation
+    df.to_csv("bart_rouge_results.csv", index=False)
 '''
-# Whole word masking (modified)
-def get_whole_word_mask(dictionary):
-    def is_beginning_of_word(i):
-        tok = dictionary[i]
-        if tok.startswith("madeupword"):
-            return True
-        try:
-            if tok in ["<unk", "<s>", "</s>", "<pad>"]:
-                return True
-            else:
-                return tok.startswith("\u0120")
-        except ValueError:
-            return True
+
+# Quick validation
+def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
+    logging.info("***** Running development *****")
+
+    dev_loss = 0.0
+    nb_dev_step = 0
     
-    mask_whole_words = torch.ByteTensor(list(map(is_beginning_of_word, range(len(dictionary)))))
-    return mask_whole_words
+    model.eval()
+    for batch in tqdm(dataloader, desc="Checking dev model accuracy..."):
+        with torch.no_grad():
+            inputs = batch[0].to(device)
+            atten = batch[1].to(device)
+            labels = batch[2].to(device)
 
-def load_vocab_file(vocab_file):
-    with open(vocab_file, "r", encoding="utf-8") as reader:
-        tokens = reader.read()
-        vocab_dict = json.loads(tokens, object_pairs_hook=collections.OrderedDict)
-    return vocab_dict
-   
-# General dataset
-class PregeneratedDataset(Dataset):
-    def __init__(self, input_ids, labels):
-        self.input_ids = input_ids
-        self.labels = labels
+            outputs = model(input_ids=inputs, attention_mask=atten, labels=labels)
+            tmp_dev_loss, _ = outputs[:2]
+
+            dev_loss += tmp_dev_loss.item()
+            nb_dev_step += 1
+
+    loss = dev_loss / nb_dev_step
+    model_losses.append(loss)
+    writer.add_scalar('dev_loss', dev_loss / (nb_dev_step + 1), nb_dev_step + 1)
+
+    # Saving a trained model
+    logging.info("** ** * Saving validated model ** ** * ")
+    model_to_save = model.module if hasattr(model, 'module') else model
+
+    path = str(epoch)
+    full_path = os.path.join(args.output_dir, path)
+    if os.path.exists(full_path):
+        shutil.rmtree(full_path)
+    os.mkdir(full_path)
+    output_model_file = os.path.join(args.output_dir, path, "pytorch_model.bin")
+    output_config_file = os.path.join(args.output_dir, path, "config.json")
+
+    torch.save(model_to_save.state_dict(), output_model_file)
+    model_to_save.config.to_json_file(output_config_file)
+    tokenizer.save_vocabulary(os.path.join(args.output_dir, path))
+
+def WithReplacementRandomSampler(Sampler):
+    """Samples elements randomly, with replacement.
+
+    Arguments:
+        data_source (Dataset): dataset to sample from
+    """
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __iter__(self):
+        samples = torch.LongTensor(len(self.dataset))
+        samples.random(0, len(self.dataset))
+        return iter(samples)
 
     def __len__(self):
-        return len(self.input_ids)
+        return len(self.dataset)
 
-    def __getitem__(self, index):
-        _input_ids = self.input_ids[index]
-        _labels = self.labels[index]
-
-        return _input_ids, _labels
- 
 def main():
     parser = ArgumentParser()
     # General params
+    parser.add_argument('--train', dest='train', action='store_true')
+    parser.add_argument('--notrain', dest='train', action='store_false')
     parser.add_argument('--pregenerated_data', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--bart_model', type=str, required=True, help="choose a BART pre-trained model: facebook/bart-base, facebook/bart-large, facebook/bart-large-mnli")
@@ -73,292 +131,199 @@ def main():
     parser.add_argument('--no_cuda', action='store_true', help="whether or not to use CUDA when available")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help="number of update steps to accumulate before performing a backward/update pass")
     parser.add_argument('--train_batch_size', default=32, type=int, help="total batch size for training")
-    parser.add_argument('--learning_rate', default=3e-5, type=float, help="initial learning rate for Adam")
+    parser.add_argument('--learning_rate', default=1e-5, type=float, help="initial learning rate for Adam")
     parser.add_argument('--seed', type=int, default=42, help="random seed for initialization")
     parser.add_argument('--warmup_proportion', default=0.1, type=float, help="proportion of training to perform linear learning rate warmup for")
     parser.add_argument('--fp16', action='store_true', help="whether to use 16-bit float precision instead of 32-bit float precision")
     parser.add_argument('--loss_scale', type=float, default=0, help="loss scaling to improve fp16 numeric stability, used when fp16 is set to True\n"
                                                                     "0: dynamic loss scaling\n"
                                                                     "Power of 2: static loss scaling\n")
-    # Dataset params
-    parser.add_argument('--shuffle_instance', action='store_true', help='whether to shuffle the instances')
-    parser.add_argument('--mask', type=float, default=0.3, help="ratio for masking")
-    parser.add_argument('--mask_random', type=float, default=0.1, help="ratio for random masking")
-    parser.add_argument('--insert', type=float, default=0.1, help="ratio for inserting")
-    parser.add_argument('--rotate', type=float, default=0.1, help="ratio for rotating")
-    parser.add_argument('--permute_sentences', type=float, default=1, help="ratio for permuting sentences")
-    parser.add_argument('--replace_length', type=int, default=1, help="length of replacements")
-    parser.add_argument('--mask_length', type=str, default='span-poisson', help="length of mask")
-    parser.add_argument('--poisson_lambda', type=int, default=3, help="value of poisson")
-
     args = parser.parse_args()
-
-    if not hasattr(args, "shuffle_instance"):
-        args.shuffle_instance = False
-
-    # preparing the model and tokenizer
-    tokenizer = BartTokenizer.from_pretrained(args.bart_model, do_lower_case=args.do_lower_case)
+   
+     
+    tokenizer = BartTokenizer.from_pretrained(args.bart_model)
     model = BartForConditionalGeneration.from_pretrained(args.bart_model)
-
-    # get the files and data
-    f = open(args.pregenerated_data, "rb")
-    print("Here's file:", f)
-    database = pickle.load(f)
-    print("Here's the length:", database.doclen)
-    assert database is not None
-
-    # TODO: set up the entire pipeline to encode the data here
-    # Implement denoising of sentences
-    # Call the function to get the data
-    # Replace this with a URL
-    vocab_to_idx = load_vocab_file('/gscratch/ark/limill01/clin-bias-summarization/bart/' + tokenizer.vocab_files_names['vocab_file'])
-    idx_to_vocab = {idx : i for idx, i in enumerate(vocab_to_idx)}
-
-    mask_whole_words = get_whole_word_mask(idx_to_vocab)
-    dataset = PregeneratedDataset(database.documents, database.summaries)
-    print("here's the dataset:", dataset)
-
-    dataset = ConvertedDataset(dataset, tokenizer)
-    
-    mask_idx = vocab_to_idx['<mask>']
-    bos_idx = vocab_to_idx['<s>']
-    eos_idx = vocab_to_idx['</s>']
-    pad_idx = vocab_to_idx['<pad>']
-
-    print("here's the mask idx:", mask_idx)
-
-    denoised_dataset = DenoisingDataset(
-        dataset,
-        database.sizes,
-        idx_to_vocab,
-        mask_idx,
-        mask_whole_words,
-        shuffle=args.shuffle_instance,
-        seed=args.seed,
-        args=args,
-        eos=eos_idx,
-        bos=bos_idx
-    )
-
-    if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        n_gpu = torch.cuda.device_count()
-    else:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        n_gpu = 1
-        torch.distributed.init_process_group(backend='nccl')
-    logging.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(device, n_gpu, bool(args.local_rank != -1), args.fp16))
-
-    if args.gradient_accumulation_steps < 1:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(args.gradient_accumulation_steps))
-
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
 
     if args.output_dir.is_dir() and list(args.output_dir.iterdir()):
         logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # calculate the total training examples (this could definitely change, so check this)
-    num_train_optimization_steps = int(len(database) / args.train_batch_size / args.gradient_accumulation_steps)
-    if args.local_rank != -1:
-        num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
+    # Saves the model immediately
+    if not args.train:
+        # Saving a trained model
+        logging.info("** ** * Saving base model ** ** * ")
+        model_to_save = model.module if hasattr(model, 'module') else model
 
-    if args.fp16:
-        model.half()
-    model.to(device)
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training")
-        model = DDP(model)
-    elif n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+        output_config_file = os.path.join(args.output_dir, "config.json")
 
-    # preparing the optimizer
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
+        torch.save(model_to_save.state_dict(), output_model_file)
+        model_to_save.config.to_json_file(output_config_file)
+        tokenizer.save_vocabulary(args.output_dir)  
 
-    if args.fp16:
-        try:
-            from apex.optimizers import FP16_Optimizer
-            from apex.optimizers import FusedAdam
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training")
-
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_Scale)
+    # Training loop
     else:
-        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
-     
-    num_warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
-    num_training_steps = int((1 - args.warmup_proportion) * num_train_optimization_steps)
-    warmup_linear = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-   
-    global_step = 0
-    logging.info("***** Running training *****")
-    logging.info(f"  Num examples = {len(database)}")
-    logging.info("  Batch size = %d", args.train_batch_size)
-    logging.info("  Num steps = %d", num_train_optimization_steps)
-    model.train()
-    for epoch in range(args.epochs):
-        epoch_dataset = denoised_dataset
-        if args.local_rank == -1:
-            train_sampler = RandomSampler(epoch_dataset)
+        if not hasattr(args, "shuffle_instance"):
+            args.shuffle_instance = False
+
+        # get files and data
+        f = open(args.pregenerated_data, "rb")
+        database = pickle.load(f)
+        assert database is not None
+
+        # vocab
+        vocab_to_idx = tokenizer.get_vocab()
+        idx_to_vocab = {idx : i for idx, i in enumerate(vocab_to_idx)}
+
+        # special tokens
+        mask_idx = vocab_to_idx['<mask>']
+        bos_idx = vocab_to_idx['<s>']
+        eos_idx = vocab_to_idx['</s>']
+        pad_idx = vocab_to_idx['<pad>']
+
+        # TESTING
+        # database.documents = [database.documents[0]]
+        # database.summaries = [database.summaries[0]]
+
+        train_idx = int(0.8 * len(database.documents))
+
+        dataset_train = PregeneratedDataset(database.documents[:train_idx], database.summaries[:train_idx])
+        dataset_train = ConvertedDataset(dataset_train, tokenizer, pad_idx)
+
+        dataset_dev = PregeneratedDataset(database.documents[train_idx:], database.summaries[train_idx:])
+        dataset_dev = ConvertedDataset(dataset_dev, tokenizer, pad_idx)
+
+        # datasets
+        # dataset = PregeneratedDataset(database.documents, database.summaries)
+        # dataset = ConvertedDataset(dataset, tokenizer, pad_idx)
+
+        if args.local_rank == -1 or args.no_cuda:
+            device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+            n_gpu = torch.cuda.device_count()
         else:
-            train_sampler = DistributedSampler(epoch_dataset)
-        train_dataloader = DataLoader(
-            epoch_dataset,
-            sampler=train_sampler, 
-            batch_size=args.train_batch_size,
-            collate_fn=(lambda samples: collate(
-                samples=samples,pad_idx=pad_idx, eos_idx=eos_idx, vocab=vocab_to_idx))
-        )
-        epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch}")
-        tr_loss = 0
-        nb_tr_examples, nb_tr_steps = 0, 0
-        # with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch}") as pbar:
-        for step, batch in enumerate(epoch_iterator):
-            input_ids = batch['net_input']['src_tokens'].to(device)
-            decoder_input_ids = batch['net_input']['prev_output_tokens'].to(device)
-            labels = batch['target'].to(device)
-           
-            '''
-            print(type(batch))
+            torch.cuda.set_device(args.local_rank)
+            device = torch.device("cuda", args.local_rank)
+            n_gpu = 1
+            torch.distributed.init_process_group(backend='nccl')
+        logging.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(device, n_gpu, bool(args.local_rank != -1), args.fp16))
 
-            src_tokens = batch['net_input']['src_tokens'][0].numpy()
-            print("checking:", src_tokens)
-            string = [idx_to_vocab[s] for s in src_tokens]
-            print("checking src 1:", string)  
-            
-            src_tokens2 = batch['net_input']['src_tokens'][1].numpy()
-            print("checking 2:", src_tokens2)
-            string = [idx_to_vocab[s] for s in src_tokens2]
-            print("checking src 2:", string)
+        if args.gradient_accumulation_steps < 1:
+            raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(args.gradient_accumulation_steps))
 
-            print("SHAPE OF INPUT_IDS:", input_ids.size())
-            
-            prev_token = batch['net_input']['prev_output_tokens'][0].numpy()
-            print("checking prev:", prev_token)
-            string = [idx_to_vocab[s] for s in prev_token]
-            print("checking prev token 1:", string)
+        args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
-            prev_token2 = batch['net_input']['prev_output_tokens'][1].numpy()
-            print("checking prev 2:", prev_token2)
-            string = [idx_to_vocab[s] for s in prev_token2]
-            print("checking prev token 2:", string)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if n_gpu > 0:
+            torch.cuda.manual_seed_all(args.seed)
 
-            print("SHAPE OF DECODER_IDS:", decoder_input_ids.size())
+        # if args.output_dir.is_dir() and list(args.output_dir.iterdir()):
+            #logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
+        # args.output_dir.mkdir(parents=True, exist_ok=True)
 
-            target = batch['target'][0].numpy()
-            print("checking target:", target)
-            string = [idx_to_vocab[s] for s in target]
-            print("checking target 1:", string)
+        # calculate the total training examples (this could definitely change, so check this)
+        num_train_optimization_steps = int(len(database) / args.train_batch_size / args.gradient_accumulation_steps)
+        if args.local_rank != -1:
+            num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
-            print("SHAPE OF LABELS:", labels.size())
+        if args.fp16:
+            model.half()
+        model.to(device)
+        if args.local_rank != -1:
+            try:
+                from apex.parallel import DistributedDataParallel as DDP
+            except ImportError:
+                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training")
+            model = DDP(model)
+        elif n_gpu > 1:
+            model = torch.nn.DataParallel(model)
 
-            target2 = batch['target'][1].numpy()
-            print("checking target:", target2)
-            string = [idx_to_vocab[s] for s in target2]
-            print("checking target 2:", string)
-            '''
+        params = [p for n,p in model.named_parameters()]
+        optimizer = AdamW(params, lr=args.learning_rate)
 
-            outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids, labels=labels)
-            loss = outputs[0]
+        global_step = 0
+        logging.info("****** Running training *****")
+        logging.info(f"  Num examples = {len(database)}")
+        logging.info(f"  Num epochs = {args.epochs}")
+        logging.info(f"  Batch size = {args.train_batch_size}")
+        logging.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
+        
+        model.train()
+        model_losses = []
 
-            if n_gpu > 1:
-                loss = loss.mean()
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                optimizer.backward(loss)
+        total_loss = 0.0
+        for epoch in range(args.epochs):
+            epoch_dataset = dataset_train
+            if args.local_rank == -1:
+                train_sampler = WithReplacementRandomSampler(epoch_dataset) #RandomSampler(epoch_dataset)
             else:
-                loss.backward()
-            tr_loss += loss.item()
-            nb_tr_examples += input_ids.size(0)
-            nb_tr_steps += 1
-            mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-            epoch_iterator.set_postfix_str(f"Loss: {mean_loss:.5f}")
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+                train_sampler = DistributedSampler(epoch_dataset)
+
+            train_dataloader = DataLoader(
+                epoch_dataset,
+                sampler=train_sampler,
+                batch_size=args.train_batch_size,
+                collate_fn=(lambda samples: collate(
+                    samples=samples, pad_idx=pad_idx, eos_idx=eos_idx, vocab=vocab_to_idx, tokenizer=tokenizer))
+            )
+            epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch}", position=0, leave=True)
+            tr_loss = 0
+            nb_tr_examples, nb_tr_steps = 0, 0
+            for step, batch in enumerate(epoch_iterator):
+
+                input_ids, atten, labels = batch
+                input_ids = input_ids.to(device)
+                atten = atten.to(device)
+                labels = labels.to(device)
+
+                outputs = model(input_ids=input_ids, attention_mask=atten, labels=labels)
+                loss = outputs[0]
+
+                if n_gpu > 1:
+                    loss = loss.mean()
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
                 if args.fp16:
-                    lr_this_step = args.learning_rate * warmup_linear.get_lr(global_step, args.warmup_proportion)
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr_this_step
-                optimizer.step()
-                optimizer.zero_grad()
-                global_step += 1
-    
-    # Saving a trained model
-    logging.info("** ** * Saving finetuned model ** ** * ")
-    model_to_save = model.module if hasattr(model, 'module') else model
+                    optimizer.backward(loss)
+                else:
+                    loss.backward()
+                tr_loss += loss.item()
+                total_loss += loss.item()
+                nb_tr_examples += input_ids.size(0)
+                nb_tr_steps += 1
+                mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
+                epoch_iterator.set_description(f"Loss: {mean_loss:.5f}")
 
-    # Fix these two
-    output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
-    output_config_file = os.path.join(args.output_dir, "config.json")
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    #writer.add_scalar('train loss', tr_loss / (global_step + 1), global_step + 1)
+                    writer.add_scalar('train loss', total_loss / (global_step + 1), global_step)
+                    global_step += 1
 
-    torch.save(model_to_save.state_dict(), output_model_file)
-    model_to_save.config.to_json_file(output_config_file)
-    tokenizer.save_vocabulary(args.output_dir)
+            validate(args, model, tokenizer, dataset_dev, device, epoch, model_losses)
 
-    '''
-    print(type(batch))
+        writer.flush()
+        writer.close()
+     
+        # Get the best model
+        loss_arr = np.asarray(model_losses)
+        min_loss_idx = np.argmin(loss_arr)
+        path = str(min_loss_idx)
+        tokenizer = BartTokenizer.from_pretrained(os.path.join(args.output_dir, path))
+        model = BartForConditionalGeneration.from_pretrained(os.path.join(args.output_dir, path))
+       
+        # Now saving the model 
+        logging.info("** ** * Saving finetuned model ** ** * ")
+        model_to_save = model.module if hasattr(model, 'module') else model
 
-    src_tokens = batch['net_input']['src_tokens'][0].numpy()
-    print("checking:", src_tokens)
-    string = [idx_to_vocab[s] for s in src_tokens]
-    print("checking src 1:", string)
-    
-    
-    src_tokens2 = batch['net_input']['src_tokens'][1].numpy()
-    print("checking 2:", src_tokens2)
-    string = [idx_to_vocab[s] for s in src_tokens2]
-    print("checking src 2:", string)
-    
-    
-    prev_token = batch['net_input']['prev_output_tokens'][0].numpy()
-    print("checking prev:", prev_token)
-    string = [idx_to_vocab[s] for s in prev_token]
-    print("checking prev token 1:", string)
+        output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+        output_config_file = os.path.join(args.output_dir, "config.json")
 
-    prev_token2 = batch['net_input']['prev_output_tokens'][1].numpy()
-    print("checkign prev 2:", prev_token2)
-    string = [idx_to_vocab[s] for s in prev_token2]
-    print("checking prev token 2:", string)
+        torch.save(model_to_save.state_dict(), output_model_file)
+        model_to_save.config.to_json_file(output_config_file)
+        tokenizer.save_vocabulary(args.output_dir) 
 
-    target = batch['target'][0].numpy()
-    print("checking target:", target)
-    string = [idx_to_vocab[s] for s in target]
-    print("checking target 1:", string)
-
-    target2 = batch['target'][1].numpy()
-    print("checking target:", target2)
-    string = [idx_to_vocab[s] for s in target2]
-    print("checking target 2:", string)
-
-    string = [idx_to_vocab[s] for s in batch['net_input']['prev_output_tokens']]
-    print("checking output:", string)
-    
-    print("checking batch:", batch)
-    batch = tuple(t.to(device) for t in batch)
-    print("checking batch:", batch)
-    '''
 if __name__ == '__main__':
     main()
-

@@ -13,11 +13,17 @@ from tempfile import TemporaryDirectory
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
+from functools import partial
 
+from transformers import BartForConditionalGeneration, BartTokenizer, AdamW
 from pytorch_pretrained_bert import WEIGHTS_NAME, CONFIG_NAME
-from pytorch_pretrained_bert.modeling import BertForPreTraining
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+#from pytorch_pretrained_bert.modeling import BertForPreTraining
+#from pytorch_pretrained_bert.tokenization import BertTokenizer
+#from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+
+import sys
+sys.path.insert(1, '/gscratch/ark/limill01/Clinical-Bias-Summarizations/utils')
+import parse_data as parse
 
 InputFeatures = namedtuple("InputFeatures", "input_ids input_mask segment_ids lm_label_ids is_next")
 
@@ -55,6 +61,23 @@ def convert_example_to_features(example, tokenizer, max_seq_length):
                              is_next=is_random_next)
     return features
 
+class PregeneratedDataset(Dataset):
+    def __init(self, ids, masks, labels):
+        self.ids = ids
+        self.masks = masks
+        self.labels = labels
+    
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, index):
+        _id = self.ids[index]
+        _mask = self.masks[index]
+        _label = self.labels[index]
+
+        return _id, _mask, _label
+
+'''
 
 class PregeneratedDataset(Dataset):
     def __init__(self, training_path, epoch, tokenizer, num_data_epochs, reduce_memory=False):
@@ -120,13 +143,13 @@ class PregeneratedDataset(Dataset):
                 torch.tensor(self.segment_ids[item].astype(np.int64)),
                 torch.tensor(self.lm_label_ids[item].astype(np.int64)),
                 torch.tensor(self.is_nexts[item].astype(np.int64)))
-
+'''
 
 def main():
     parser = ArgumentParser()
     parser.add_argument('--pregenerated_data', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
-    parser.add_argument("--bert_model", type=str, required=True, help="Bert pre-trained model selected in the list: bert-base-uncased, "
+    parser.add_argument("--bart_model", type=str, required=True, help="Bert pre-trained model selected in the list: bert-base-uncased, "
                              "bert-large-uncased, bert-base-cased, bert-base-multilingual, bert-base-chinese.")
     parser.add_argument("--do_lower_case", action="store_true")
     parser.add_argument("--reduce_memory", action="store_true",
@@ -176,8 +199,11 @@ def main():
 
     samples_per_epoch = []
     for i in range(args.epochs):
+        print("checking args.pregenerated_data:", args.pregenerated_data)
         epoch_file = args.pregenerated_data / f"epoch_{i}.json"
         metrics_file = args.pregenerated_data / f"epoch_{i}_metrics.json"
+        print("Checking the epoch file:", epoch_file)
+        print("Checking the metrics file:", metrics_file)
         if epoch_file.is_file() and metrics_file.is_file():
             metrics = json.loads(metrics_file.read_text())
             samples_per_epoch.append(metrics['num_training_examples'])
@@ -219,7 +245,7 @@ def main():
         logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    tokenizer = BartTokenizer.from_pretrained(args.bart_model, do_lower_case=args.do_lower_case)
 
     total_train_examples = 0
     for i in range(args.epochs):
@@ -232,7 +258,7 @@ def main():
         num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
-    model = BertForPreTraining.from_pretrained(args.bert_model)
+    model = BartForConditionalGeneration.from_pretrained(args.bart_model)
     if args.fp16:
         model.half()
     model.to(device)
@@ -274,10 +300,24 @@ def main():
         warmup_linear = WarmupLinearSchedule(warmup=args.warmup_proportion,
                                              t_total=num_train_optimization_steps)
     else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
+        print("group params:", optimizer_grouped_parameters)
+        # CustomAdamW = partial(AdamW, correct_bias=False)
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
+    # optimizer = BertAdam(optimizer_grouped_parameters,
+        #                     lr=args.learning_rate,
+        #                     warmup=args.warmup_proportion,
+        #                     t_total=num_train_optimization_steps)
+    # optimizer = AdamW(optimizer_grouped_parameters,
+    #         lr=args.learning_rate,
+    #         warmup=args.warmup_proportion,
+    #         t_total=num_train_optimization_steps,
+    #         correct_bias=False)
+
+    ### ADDED STUFF
+    # get the data
+    # doc, summary = parse.clean_cxr(args.pregenerated_data)
+    # maxlen = parse.find_longest_text_len(doc)
+    # inputs = tokenizer.prepare_seq2seq_batch(doc, summary, max_length=maxlen, truncation=True, padding=True, return_tensors='pt')
 
     global_step = 0
     logging.info("***** Running training *****")
@@ -288,6 +328,8 @@ def main():
     for epoch in range(args.epochs):
         epoch_dataset = PregeneratedDataset(epoch=epoch, training_path=args.pregenerated_data, tokenizer=tokenizer,
                                             num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
+        # epoch_dataset = PregeneratedDataset(inputs['input_ids'], inputs['attention_mask'], inputs['labels'])
+
         if args.local_rank == -1:
             train_sampler = RandomSampler(epoch_dataset)
         else:
@@ -299,7 +341,9 @@ def main():
             for step, batch in enumerate(train_dataloader):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next = batch
+                # inputs, atten, labels = batch
                 loss = model(input_ids, segment_ids, input_mask, lm_label_ids, is_next)
+                # loss = model(inputs_ids=inputs, attention_mask=atten, labels=labels)
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:

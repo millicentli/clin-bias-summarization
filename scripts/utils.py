@@ -111,18 +111,17 @@ class MIMICDataset(data.Dataset):
         return all_input_ids, all_input_mask, all_segment_ids, y, group, guid, other_vars
 
 
-def extract_embeddings(v, emb_method):
+def extract_embeddings(last_hidden, hidden, emb_method):
     '''
-    Given a BERT list of hidden layer states, extract the appropriate embedding
+    Given a BART list of hidden layer states, extract the appropriate embedding
     '''
+
     if emb_method == 'last':
-        return v[-1][:, 0, :] #last layer CLS token
+        return last_hidden[:, 0, :]
     elif emb_method == 'sum4':
-        return v[-1][:, 0, :] + v[-2][:, 0, :] + v[-3][:, 0, :] + v[-4][:, 0, :]
+        return last_hidden[:, 0, :] + hidden[-1][:, 0, :] + hidden[-2][:, 0, :] + hidden[-3][:, 0, :]
     elif emb_method == 'cat4':
-        return torch.cat((v[-1][:, 0, :] , v[-2][:, 0, :] , v[-3][:, 0, :] , v[-4][:, 0, :]), 1)
-
-
+        return torch.cat((last_hidden[:, 0, :], hidden[-1][:, 0, :], hidden[-2][:, 0, :], hidden[-3][:, 0, :]), 1)
 
 #from Bjarten/early-stopping-pytorch
 class EarlyStopping:

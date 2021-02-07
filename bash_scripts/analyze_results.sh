@@ -1,14 +1,7 @@
 #!/bin/sh
-#SBATCH --partition cpu 
-#SBATCH -c 2
-#SBATCH --output bootstrap%A.log
-#SBATCH --mem 50gb
 
-set -e
-source activate hurtfulwords
-
-BASE_DIR="/h/haoran/projects/HurtfulWords"
-OUTPUT_DIR="/h/haoran/projects/HurtfulWords/data/"
+BASE_DIR="/gscratch/ark/limill01/clin-bias-summarization"
+OUTPUT_DIR="/gscratch/ark/limill01/clin-bias-summarization/data"
 cd "$BASE_DIR/scripts"
 
 python analyze_results.py \
