@@ -6,7 +6,6 @@ import pickle
 import random
 import collections
 import json
-import json
 import os
 import numpy as np
 import pandas as pd
@@ -16,52 +15,27 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler
 from tqdm import tqdm, trange
 from functools import partial
 from pregenerate_train_sums import DocumentDatabase
-from dataset_util import ConvertedDataset, PregeneratedDataset, collate
-from datasets import load_metric
+from dataset_util import ConvertedDataset, PregeneratedDataset, collate_fn
 
 from transformers import BartForConditionalGeneration, BartTokenizer, AdamW, get_linear_schedule_with_warmup
+
+## TODO: Clean up extraneous code that's not necessary
 
 log_format = '%(asctime)-10s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
 writer = SummaryWriter()
 
-'''
-# Quick evaluation
-def evaluate(model, tokenizer, dataloader, device):
-    logger.info("***** Running evaluation *****")
-
-    total = 0
-    nb_eval_step = 0
-
-    rouge = load_metric('rouge')
-
-    model.eval()
-    for batch in tqdm(test_dataloader):
-        inputs = batch[0].to(device)
-        atten = batch[1].to(device)
-        labels = batch[2].to(device)
-        
-        # Predicted words
-        out_ypred = model.generate(inputs, max_length=20, num_beams=5, length_penalty=2.0, early_stopping=True)
-        words_ypred = tokenizer.decode(out_ypred[0].tolist())
-
-        # Actual words
-        words_label = tokenizer.decode(labels[0].tolist())
-
-        rouge.add(words_ypred, words_label)
-
-    score = rouge.compute(rouge_types["rouge1", "rouge2", "rougeL"])
-
-    df = pd.DataFrame(score)
-    df.columns = ["Rouge1", "Rouge2", "RougeL"]
-
-    # Writing the output of the evaluation
-    df.to_csv("bart_rouge_results.csv", index=False)
-'''
-
 # Quick validation
-def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
+def validate(args, model, tokenizer, data, device, epoch, model_losses):
     logging.info("***** Running development *****")
+
+    dataloader = DataLoader(
+        data,
+        shuffle=True,
+        batch_size=args.train_batch_size,
+        collate_fn=(lambda samples: collate_fn(
+            samples=samples, tokenizer=tokenizer))
+    )
 
     dev_loss = 0.0
     nb_dev_step = 0
@@ -69,9 +43,10 @@ def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
     model.eval()
     for batch in tqdm(dataloader, desc="Checking dev model accuracy..."):
         with torch.no_grad():
-            inputs = batch[0].to(device)
-            atten = batch[1].to(device)
-            labels = batch[2].to(device)
+            inputs, atten, labels = batch
+            inputs = inputs.to(device)
+            atten = atten.to(device)
+            labels = labels.to(device)
 
             outputs = model(input_ids=inputs, attention_mask=atten, labels=labels)
             tmp_dev_loss, _ = outputs[:2]
@@ -81,7 +56,7 @@ def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
 
     loss = dev_loss / nb_dev_step
     model_losses.append(loss)
-    writer.add_scalar('dev_loss', dev_loss / (nb_dev_step + 1), nb_dev_step + 1)
+    writer.add_scalar('dev_loss', loss, epoch)
 
     # Saving a trained model
     logging.info("** ** * Saving validated model ** ** * ")
@@ -117,6 +92,23 @@ def WithReplacementRandomSampler(Sampler):
     def __len__(self):
         return len(self.dataset)
 
+# General dataset
+class Dataset(Dataset):
+    def __init__(self, ids, masks, labels):
+        self.ids = ids
+        self.masks = masks
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, index):
+        _id = self.ids[index]
+        _mask = self.masks[index]
+        _label = self.labels[index]
+
+        return _id, _mask, _label
+
 def main():
     parser = ArgumentParser()
     # General params
@@ -138,6 +130,7 @@ def main():
     parser.add_argument('--loss_scale', type=float, default=0, help="loss scaling to improve fp16 numeric stability, used when fp16 is set to True\n"
                                                                     "0: dynamic loss scaling\n"
                                                                     "Power of 2: static loss scaling\n")
+    parser.add_argument('--grad_clip', type=float, default=0.25, help="Grad clipping value")
     args = parser.parse_args()
    
      
@@ -181,21 +174,10 @@ def main():
         eos_idx = vocab_to_idx['</s>']
         pad_idx = vocab_to_idx['<pad>']
 
-        # TESTING
-        # database.documents = [database.documents[0]]
-        # database.summaries = [database.summaries[0]]
-
         train_idx = int(0.8 * len(database.documents))
 
         dataset_train = PregeneratedDataset(database.documents[:train_idx], database.summaries[:train_idx])
-        dataset_train = ConvertedDataset(dataset_train, tokenizer, pad_idx)
-
         dataset_dev = PregeneratedDataset(database.documents[train_idx:], database.summaries[train_idx:])
-        dataset_dev = ConvertedDataset(dataset_dev, tokenizer, pad_idx)
-
-        # datasets
-        # dataset = PregeneratedDataset(database.documents, database.summaries)
-        # dataset = ConvertedDataset(dataset, tokenizer, pad_idx)
 
         if args.local_rank == -1 or args.no_cuda:
             device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -211,21 +193,11 @@ def main():
             raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(args.gradient_accumulation_steps))
 
         args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-
         random.seed(args.seed)
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         if n_gpu > 0:
             torch.cuda.manual_seed_all(args.seed)
-
-        # if args.output_dir.is_dir() and list(args.output_dir.iterdir()):
-            #logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
-        # args.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # calculate the total training examples (this could definitely change, so check this)
-        num_train_optimization_steps = int(len(database) / args.train_batch_size / args.gradient_accumulation_steps)
-        if args.local_rank != -1:
-            num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
         if args.fp16:
             model.half()
@@ -249,30 +221,33 @@ def main():
         logging.info(f"  Batch size = {args.train_batch_size}")
         logging.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
         
-        model.train()
         model_losses = []
-
         total_loss = 0.0
-        for epoch in range(args.epochs):
+         
+        train_iterator = trange(0, args.epochs, desc="Epoch")
+        for epoch, _ in enumerate(train_iterator):
             epoch_dataset = dataset_train
             if args.local_rank == -1:
-                train_sampler = WithReplacementRandomSampler(epoch_dataset) #RandomSampler(epoch_dataset)
+                train_sampler = RandomSampler(epoch_dataset)
             else:
                 train_sampler = DistributedSampler(epoch_dataset)
 
             train_dataloader = DataLoader(
                 epoch_dataset,
-                sampler=train_sampler,
                 batch_size=args.train_batch_size,
-                collate_fn=(lambda samples: collate(
-                    samples=samples, pad_idx=pad_idx, eos_idx=eos_idx, vocab=vocab_to_idx, tokenizer=tokenizer))
-            )
-            epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch}", position=0, leave=True)
+                shuffle=True,
+                collate_fn=(lambda samples: collate_fn(
+                                    samples=samples, tokenizer=tokenizer))
+            )                
+            
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration")
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(epoch_iterator):
+                model.train()
 
                 input_ids, atten, labels = batch
+
                 input_ids = input_ids.to(device)
                 atten = atten.to(device)
                 labels = labels.to(device)
@@ -280,28 +255,15 @@ def main():
                 outputs = model(input_ids=input_ids, attention_mask=atten, labels=labels)
                 loss = outputs[0]
 
-                if n_gpu > 1:
-                    loss = loss.mean()
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
-                if args.fp16:
-                    optimizer.backward(loss)
-                else:
-                    loss.backward()
-                tr_loss += loss.item()
+                loss.backward()
                 total_loss += loss.item()
-                nb_tr_examples += input_ids.size(0)
-                nb_tr_steps += 1
-                mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-                epoch_iterator.set_description(f"Loss: {mean_loss:.5f}")
-
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    #writer.add_scalar('train loss', tr_loss / (global_step + 1), global_step + 1)
-                    writer.add_scalar('train loss', total_loss / (global_step + 1), global_step)
-                    global_step += 1
-
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                model.zero_grad()
+                global_step += 1
+                epoch_iterator.set_description(f"Loss: {total_loss / (global_step + 1)}")
+                writer.add_scalar('train loss', total_loss / (global_step + 1), global_step)
+            
             validate(args, model, tokenizer, dataset_dev, device, epoch, model_losses)
 
         writer.flush()
@@ -313,7 +275,9 @@ def main():
         path = str(min_loss_idx)
         tokenizer = BartTokenizer.from_pretrained(os.path.join(args.output_dir, path))
         model = BartForConditionalGeneration.from_pretrained(os.path.join(args.output_dir, path))
-       
+        
+        logging.info(f"****** Resulting Path: {path} ******")
+
         # Now saving the model 
         logging.info("** ** * Saving finetuned model ** ** * ")
         model_to_save = model.module if hasattr(model, 'module') else model

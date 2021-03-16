@@ -13,22 +13,26 @@ import shutil
 import numpy as np
 import pandas as pd
 
+import pdb
+
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from tqdm import tqdm, trange
 from functools import partial
 from pregenerate_train_sums import DocumentDatabase
-from dataset_util import ConvertedDataset, PregeneratedDataset, collate
+from dataset_util import ConvertedDataset, PregeneratedDataset, collate_fn
 from rouge import Rouge
 
 from transformers import BartForConditionalGeneration, BartTokenizer, AdamW, get_linear_schedule_with_warmup
+
+### TODO: Clean up extraneous code that's not necessary
 
 log_format = '%(asctime)-10s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
 writer = SummaryWriter()
 
 # Quick evaluation
-def evaluate(model, tokenizer, dataloader, device):
+def evaluate(args, model, tokenizer, data, device):
     logging.info("***** Running evaluation *****")
 
     total = 0
@@ -37,29 +41,35 @@ def evaluate(model, tokenizer, dataloader, device):
     predictions = []
     actual = []
     
+    dataloader = DataLoader(
+        data,
+        shuffle=True,
+        batch_size=args.train_batch_size,
+        collate_fn=(lambda samples: collate_fn(
+            samples=samples, tokenizer=tokenizer))
+    )
+
     rouge = Rouge()
 
     model.to(device)
     model.eval()
     for batch in tqdm(dataloader):
-        inputs = batch[0].to(device)
-        atten = batch[1].to(device)
-        labels = batch[2].to(device)
+        inputs, atten, labels = batch
+        inputs = inputs.to(device)
+        atten = atten.to(device)
+        labels = labels.to(device)
         
         # Predicted words
         out_ypred = model.generate(inputs, max_length=100, num_beams=5, length_penalty=2.0, early_stopping=True)
-        words_ypred = tokenizer.decode(out_ypred[0].tolist())
+        words_ypred = tokenizer.decode(out_ypred[0].tolist(), skip_special_tokens=True)
 
         # Actual words
-        words_label = tokenizer.decode(labels[0].tolist())
+        words_label = tokenizer.decode(labels[0].tolist(), skip_special_tokens=True)
 
-        print("Predicted:", words_ypred)
-        print("Actual:", words_label)
 
         predictions.append(words_ypred)
         actual.append(words_label)
-        break
-        
+
     scores = rouge.get_scores(predictions, actual, avg=True)
 
     # Writing this to CSV
@@ -71,8 +81,16 @@ def evaluate(model, tokenizer, dataloader, device):
     
 
 # Quick validation
-def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
+def validate(args, model, tokenizer, data, device, epoch, model_losses):
     logging.info("***** Running validation *****")
+
+    dataloader = DataLoader(
+        data,
+        shuffle=True,
+        batch_size=args.train_batch_size,
+        collate_fn=(lambda samples: collate_fn(
+            samples=samples, tokenizer=tokenizer))
+    )     
 
     dev_loss = 0.0
     nb_dev_step = 0
@@ -80,9 +98,10 @@ def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
     model.eval()
     for batch in tqdm(dataloader, desc="Checking dev model accuracy..."):
         with torch.no_grad():
-            inputs = batch[0].to(device)
-            atten = batch[1].to(device)
-            labels = batch[2].to(device)
+            inputs, atten, labels = batch
+            inputs = inputs.to(device)
+            atten = atten.to(device)
+            labels = labels.to(device)
 
             outputs = model(input_ids=inputs, attention_mask=atten, labels=labels)
             tmp_dev_loss, _ = outputs[:2]
@@ -111,6 +130,22 @@ def validate(args, model, tokenizer, dataloader, device, epoch, model_losses):
     model_to_save.config.to_json_file(output_config_file)
     tokenizer.save_vocabulary(os.path.join(args.output_dir, path))
 
+class Dataset(Dataset):
+    def __init__(self, ids, masks, labels):
+        self.ids = ids
+        self.masks = masks
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, index):
+        _id = self.ids[index]
+        _mask = self.masks[index]
+        _label = self.labels[index]
+
+        return _id, _mask, _label
+
 def main():
     parser = ArgumentParser()
     # General params
@@ -130,6 +165,7 @@ def main():
     parser.add_argument('--loss_scale', type=float, default=0, help="loss scaling to improve fp16 numeric stability, used when fp16 is set to True\n"
                                                                     "0: dynamic loss scaling\n"
                                                                     "Power of 2: static loss scaling\n")
+    parser.add_argument('--grad_clip', type=float, default=0.25, help="Grad clipping value")
     args = parser.parse_args()
 
     tokenizer = BartTokenizer.from_pretrained(args.bart_model)
@@ -138,12 +174,13 @@ def main():
     if args.output_dir.is_dir() and list(args.output_dir.iterdir()):
         logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
+    
+    
     # get files and data
     f = open(args.pregenerated_data, "rb")
     database = pickle.load(f)
     assert database is not None
-
+    
     # vocab
     vocab_to_idx = tokenizer.get_vocab()
     idx_to_vocab = {idx : i for idx, i in enumerate(vocab_to_idx)}
@@ -154,17 +191,14 @@ def main():
     eos_idx = vocab_to_idx['</s>']
     pad_idx = vocab_to_idx['<pad>']
 
-    # datasets
+    # Datasets
+    
     train_idx = int(0.8 * len(database.documents))
     test_idx = int(0.1 * len(database.documents))
     dataset_train = PregeneratedDataset(database.documents[:train_idx], database.summaries[:train_idx])
-    dataset_train = ConvertedDataset(dataset_train, tokenizer, pad_idx)
-
     dataset_dev = PregeneratedDataset(database.documents[train_idx: len(database.documents) - test_idx], database.summaries[train_idx: len(database.documents) - test_idx])
-    dataset_dev = ConvertedDataset(dataset_dev, tokenizer, pad_idx)
-
     dataset_test = PregeneratedDataset(database.documents[train_idx + test_idx:], database.summaries[train_idx + test_idx:])
-    dataset_test = ConvertedDataset(dataset_test, tokenizer, pad_idx)
+    
 
     device = None
     if args.local_rank == -1 or args.no_cuda:
@@ -190,16 +224,7 @@ def main():
     torch.manual_seed(args.seed)
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
-
-    # if args.output_dir.is_dir() and list(args.output_dir.iterdir()):
-        #logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
-    # args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    # calculate the total training examples (this could definitely change, so check this)
-    num_train_optimization_steps = int(len(database) / args.train_batch_size / args.gradient_accumulation_steps)
-    if args.local_rank != -1:
-        num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
-
+    
     if args.fp16:
         model.half()
     model.to(device)
@@ -211,7 +236,9 @@ def main():
         model = DDP(model)
     elif n_gpu > 1:
         model = torch.nn.DataParallel(model)
+    
 
+    model.to(device)
     params = [p for n,p in model.named_parameters()]
     optimizer = AdamW(params, lr=args.learning_rate)
 
@@ -221,30 +248,37 @@ def main():
     logging.info(f"  Num epochs = {args.epochs}")
     logging.info(f"  Batch size = {args.train_batch_size}")
     logging.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
-
-    '''
-    model.train()
+    
     model_losses = []
     total_loss = 0.0
-    for epoch in range(args.epochs):
+    
+    train_iterator = trange(0, args.epochs, desc="Epoch")
+    for epoch, _ in enumerate(train_iterator):
+        
         epoch_dataset = dataset_train
+        
         if args.local_rank == -1:
             train_sampler = RandomSampler(epoch_dataset)
         else:
             train_sampler = DistributedSampler(epoch_dataset)
-
+        
         train_dataloader = DataLoader(
             epoch_dataset,
-            sampler=train_sampler,
             batch_size=args.train_batch_size,
-            collate_fn=(lambda samples: collate(
-                samples=samples, pad_idx=pad_idx, eos_idx=eos_idx, vocab=vocab_to_idx, tokenizer=tokenizer)))
-        epoch_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch}", position=0, leave=True)
+            shuffle=True,
+            collate_fn=(lambda samples: collate_fn(
+                                samples=samples, tokenizer=tokenizer))
+        )
+
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration")
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
+        
         for step, batch in enumerate(epoch_iterator):
+            model.train()
 
             input_ids, atten, labels = batch
+
             input_ids = input_ids.to(device)
             atten = atten.to(device)
             labels = labels.to(device)
@@ -252,32 +286,17 @@ def main():
             outputs = model(input_ids=input_ids, attention_mask=atten, labels=labels)
             loss = outputs[0]
 
-            if n_gpu > 1:
-                loss = loss.mean()
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                optimizer.backward(loss)
-            else:
-                loss.backward()
-            tr_loss += loss.item()
+            loss.backward()
             total_loss += loss.item()
-            nb_tr_examples += input_ids.size(0)
-            nb_tr_steps += 1
-            mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-            epoch_iterator.set_description(f"Loss: {mean_loss:.5f}")
-
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                # writer.add_scalar('train loss', tr_loss / (global_step + 1), global_step + 1)
-                writer.add_scalar('train loss', total_loss / (global_step + 1), global_step)
-                global_step += 1
-
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            model.zero_grad()
+            global_step += 1
+            epoch_iterator.set_description(f"Loss: {total_loss / (global_step + 1)}")
+        
+        
         validate(args, model, tokenizer, dataset_dev, device, epoch, model_losses)
-    
-    '''
-    '''
+   
     writer.flush()
     writer.close()
 
@@ -290,13 +309,12 @@ def main():
     
     # Evaluate - use the best model
     min_loss_idx = np.argmin(loss_arr)
-    '''
-    path = str(4) 
-    # path = str(min_loss_idx)
+    
+    path = str(min_loss_idx)
     tokenizer = BartTokenizer.from_pretrained(os.path.join(args.output_dir, path))
     model = BartForConditionalGeneration.from_pretrained(os.path.join(args.output_dir, path))
-
-    evaluate(model, tokenizer, dataset_test, device)
+    
+    evaluate(args, model, tokenizer, dataset_test, device)
 
 if __name__ == '__main__':
     main()
