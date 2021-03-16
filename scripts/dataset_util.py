@@ -4,6 +4,7 @@ import torch
 import contextlib
 from torch.utils.data import Dataset, DataLoader
 
+'''
 def collate(
     samples,
     pad_idx,
@@ -38,14 +39,14 @@ def collate(
             pad_to_length=pad_to_length,
         )
 
-    '''
-    print("checking the samples inside of collate:", samples)
-    print("checking number of samples:", len(samples))
-    print("\n")
-    print("printing the first sample:", samples[0])
-    print("\n")
-    print("printing the second sample", samples[1])
-    '''
+    
+    #print("checking the samples inside of collate:", samples)
+    #print("checking number of samples:", len(samples))
+    #print("\n")
+    #print("printing the first sample:", samples[0])
+    #print("\n")
+    #print("printing the second sample", samples[1])
+    
 
     # find the largest batch size for samples[x][0] - pad everything to that length
     # use the largest size for samples[x][1] to pad everything else with 0's
@@ -54,7 +55,7 @@ def collate(
     # aggregate the source tokens
     # :src_tokens = [s[0] for s in samples]
     checking = [s[0] for s in samples]
-    #print("checking src tokens inside:", checking) 
+    #print("checking src tokens inside:", checking)
     src_tokens = merge(
         0,
         left_pad=left_pad_source,
@@ -78,7 +79,7 @@ def collate(
     
     src_mask = merge(
         1,
-        left_pad=left_pad_source,
+        left_pad=left_pad_source, 
         pad_to_length=pad_to_length["source"] if pad_to_length is not None else None,
     )
     
@@ -97,12 +98,162 @@ def collate(
         #print("Checking the new src_mask:", src_mask)
 
 
-    # print("checking source_mask:", source_mask)
-    # print("checking y_id:", y_id)
-    # print("checking labels:", labels)
+    print("checking source_mask:", source_mask)
+    print("checking y_id:", y_id)
+    print("checking labels:", labels)
+    exit()
 
     return src_tokens, src_mask, labels
+'''
 
+def collate_fn(
+    samples, 
+    tokenizer
+):
+    src, labels = zip(*samples)
+    #print("Here's src:", src)
+    #print("Here's labels:", labels)
+
+    src_out = tokenizer(src, padding=True, return_tensors='pt', max_length=117)
+    
+    src_tokens = src_out['input_ids']
+    atten = src_out['attention_mask']
+    #print("Here are src_tokens:", src_tokens)
+    #print("Here are atten:", atten)
+
+    labels_tok_list = []
+    maxlen = 0
+    for label in labels:
+        tokens = tokenizer.encode(label)
+        maxlen = max(maxlen, len(tokens))
+        labels_tok_list.append(tokens)
+
+    n = len(labels_tok_list)
+    d = maxlen
+    labels_arr = np.zeros((n, d), dtype=int)
+
+    for idx, label in enumerate(labels_tok_list):
+        labels_arr[idx][:len(label)] = label
+        labels_arr[idx][len(label):] = 1
+
+    labels = torch.LongTensor(labels_arr)
+    #print("Shape of src_tokens:", src_tokens.shape)
+    #print("Shape of atten:", atten.shape)
+    #print("Shape of labels:", labels.shape)
+    #exit()
+    return src_tokens, atten, labels
+
+
+'''
+def collate(
+    samples,
+    tokenizer,
+):
+    src, labels = zip(*samples)
+    dataset = tokenizer.prepare_seq2seq_batch(src, labels, truncation=True, padding=True, return_tensors='pt')
+
+    print("CHECKING DATASET INSIDE COLLATE:", dataset)
+    return dataset
+'''
+
+
+
+
+'''
+def collate(
+    samples,
+    pad_idx,
+    eos_idx,
+    vocab,
+    tokenizer,
+    left_pad_source=False,
+    left_pad_target=False,
+    input_feeding=True,
+    pad_to_length=None,
+):
+    #src_tokens = [s[0] for s in samples]
+    #attention_mask = [s[1] for s in samples]
+    #labels = [s[2] for s in samples]
+    #print("Here's the src:", src_tokens)
+    #print("Here's the atten:", attention_mask)
+    #print("Here's the labels:", labels)
+
+    src, labels = zip(*samples)
+    dataset = tokenizer.prepare_seq2seq_batch(
+
+
+    #src_tokens, attention_masks, labels = zip(*samples)
+    #print("Checking src:", src_tokens)
+    #print("Checking attention_masks:", attention_masks)
+    #print("Checking labels:", labels)
+    #lengths = [src.shape[0] for src in src_tokens]
+    #print("Here are the lengths:", src_lengths)
+    #max_len = int(max(lengths).item())
+    #print("Here's max:", max_len)
+
+    #print("DOING SRC")
+    src_tokens = collate_tokens(src_tokens, pad_idx, eos_idx)
+    #print("DOING ATTENTION")
+    atten_mask = collate_atten(attention_masks, pad_idx, eos_idx)
+    #print("DOING LABELS")
+    labels = collate_tokens(labels, pad_idx, eos_idx)
+
+    
+    print("Here's the src_tokens:", src_tokens)
+    print("Here's the atten_mask:", atten_mask)
+    print("Here's the labels:", labels)
+
+    #exit()
+    print("Shape of src_tokens:", src_tokens.shape)
+    exit()
+    return src_tokens, atten_mask, labels
+'''
+def collate_tokens(
+    values,
+    pad_idx,
+    eos_idx
+):
+    #print("Here's values:", values)
+    #print("Here's values[0]:", values[0])
+    #size = torch.Tensor([t.shape[0] for t in values])
+    print("SHAPE OF VALUES:", values[0].shape)
+    lengths = [t.shape[1] for t in values]
+    size = max(lengths)
+    res =  values[0].new(len(values), size).fill_(pad_idx)
+    #print("Showing res:", res)
+
+    def copy_tensor(src, dst):
+        dst = torch.unsqueeze(dst, 0)
+        assert dst.numel() == src.numel()
+        return dst.copy_(src)
+
+    for i, v in enumerate(values):
+        #print("size of v:", v.size())
+        copy_tensor(v, res[i][: v.size(1)])
+
+    return res
+
+def collate_atten(
+    values,
+    pad_idx,
+    eos_idx
+):
+    lengths = [t.shape[1] for t in values]
+    size = max(lengths)
+    res =  values[0].new(len(values), size).fill_(0)
+
+    def copy_tensor(src, dst):
+        dst = torch.unsqueeze(dst, 0)
+        assert dst.numel() == src.numel()
+        return dst.copy_(src)
+
+    for i, v in enumerate(values):
+        copy_tensor(v, res[i][: v.size(1)])
+
+    return res
+
+
+'''
 def pad_mask(
     values,
     pad_idx,
@@ -126,9 +277,9 @@ def pad_mask(
     for i, v in enumerate(values):
         copy_tensor(v, res[i][: v.size(1)])
 
-    exit()
     return res
-    
+'''
+'''
 def collate_tokens(
     values,
     pad_idx,
@@ -155,7 +306,36 @@ def collate_tokens(
     for i, v in enumerate(values):
         copy_tensor(v, res[i][: v.size(1)])
     return res
+'''
 
+'''
+def collate_tokens(
+    values,
+    pad_idx,
+    eos_idx,
+    left_pad=False,
+    move_eos_to_beginning=False,
+    pad_to_length=None,
+    pad_to_multiple=1,
+):
+    """Convert a list of 1d tensors into a padded 2d tensor"""
+    size = max(v.size(1) for v in values)
+    size = size if pad_to_length is None else max(size, pad_to_length)
+    if pad_to_multiple != 1 and size % pad_to_multiple != 0:
+        size = int(((size - 0.1) // pad_to_multiple + 1) * pad_to_multiple)
+
+    res = values[0].new(len(values), size). fill_(pad_idx)
+
+    def copy_tensor(src, dst):
+        dst = torch.unsqueeze(dst, 0)
+        # print("checking dst again:", dst.size())
+        assert dst.numel() == src.numel()
+        return dst.copy_(src)
+
+    for i, v in enumerate(values):
+        copy_tensor(v, res[i][: v.size(1)])
+    return res
+'''
 
 # Data converted for fine-tuning
 class ConvertedDataset(Dataset):
@@ -180,7 +360,7 @@ class ConvertedDataset(Dataset):
         # gets the input and label
         ids, labels = self.dataset[index]
         
-        inputs = self.tokenizer.prepare_seq2seq_batch(ids.text, labels.text, truncation=True, padding=True, return_tensors='pt')
+        inputs = self.tokenizer.prepare_seq2seq_batch(ids, labels, truncation=True, padding=True, return_tensors='pt')
         source_ids, source_mask, y = inputs["input_ids"], inputs["attention_mask"], inputs["labels"]
 
         return source_ids, source_mask, y
