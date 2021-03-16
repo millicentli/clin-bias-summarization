@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import subprocess
 import shlex
@@ -38,6 +39,12 @@ std_models = ['baseline_clinical_BART', 'finetuned_clinical_BART']
 tasks = [('inhosp_mort', ['inhosp_mort'],  std_models),
         ('phenotype_all', cols, std_models),
          ('phenotype_first', cols, std_models) ]
+
+slurm_file_path = '/gscratch/ark/limill01/slurm_finetune'
+
+if os.path.exists(slurm_file_path):
+    shutil.rmtree(slurm_file_path)
+os.makedirs(slurm_file_path)
 
 for dfname, targetnames, models in tasks:
     for t in targetnames:

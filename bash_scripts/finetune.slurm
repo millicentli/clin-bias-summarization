@@ -18,7 +18,7 @@
 #SBATCH --gres=gpu
 
 ## Walltime
-#SBATCH --time=120:00:00
+#SBATCH --time=5:00:00
 
 ## Memory per node
 ##SBATCH --mem=256G
@@ -41,7 +41,6 @@ source /gscratch/ark/limill01/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
 
 cd "$BASE_DIR/scripts"
-##cd /gscratch/ark/limill01/clin-bias-summarization/scripts
 
 python finetune_on_target.py \
     --df_path "${OUTPUT_DIR}/finetuning/$1" \
@@ -49,7 +48,7 @@ python finetune_on_target.py \
     --fold_id 9 10\
     --target_col_name "$3" \
     --output_dir "${OUTPUT_DIR}/models/finetuned/${1}_${2}_${3}/" \
-    --freeze_bert \
+    --freeze_bart \
     --train_batch_size 32 \
     --pregen_emb_path "${OUTPUT_DIR}/pregen_embs/pregen_${2}_cat4_${1}" \
     --task_type binary \

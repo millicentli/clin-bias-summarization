@@ -1,11 +1,9 @@
-set -e 
-source activate hurtfulwords
+#!/bin/sh
 
-BASE_DIR="/h/haoran/projects/HurtfulWords/" 
-OUTPUT_DIR="/h/haoran/projects/HurtfulWords/data/"
-#MODEL_NAME="baseline_clinical_BERT_1_epoch_512"
-#MODEL_NAME="adv_clinical_BERT_1_epoch_512" 
-MODEL_NAME="SciBERT"
+BASE_DIR="/gscratch/ark/limill01/clin-bias-summarization"
+OUTPUT_DIR="/gscratch/ark/limill01/clin-bias-summarization/data"
+#MODEL_NAME="baseline_clinical_BART"
+MODEL_NAME="finetuned_clinical_BART"
 
 cd "$BASE_DIR/scripts"
 

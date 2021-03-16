@@ -14,7 +14,7 @@ python pretrain_on_sums.py \
     --output_dir "$OUTPUT_DIR/models/baseline_clinical_BART/" \
     --bart_model "facebook/bart-base" \
     --do_lower_case \
-    --epochs 20 \
+    --epochs 10 \
     --train_batch_size 4 \
     --seed 123
 
@@ -25,7 +25,7 @@ python pretrain_on_sums.py \
     --output_dir "$OUTPUT_DIR/models/finetuned_clinical_BART/" \
     --bart_model "facebook/bart-base" \
     --do_lower_case \
-    --epochs 20 \
+    --epochs 10 \
     --train_batch_size 4 \
     --seed 123
 
