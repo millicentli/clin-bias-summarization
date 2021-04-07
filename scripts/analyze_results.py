@@ -75,7 +75,12 @@ def analyze_results(path):
 
     if 'note_id' not in df.columns:
         df = df.reset_index()
+    # path = key['output_dir'] + "_1"
+    split_path = key['output_dir'].split('/')
+    split_path[-3] += '_1'
+    path = '/'.join(split_path)
     preds = read_pickle_preds(df, pickle.load(open(os.path.join(key['output_dir'], 'preds.pkl'), 'rb')), key)
+    #preds = read_pickle_preds(df, pickle.load(open(os.path.join(path, 'preds.pkl'), 'rb')), key)
 
     if target in ('insurance_enc', 'gender_enc', 'ethnicity_to_use_enc', 'language_to_use_enc'):
         prop_name = re.findall(r'(.*)_enc', target)[0]
@@ -193,13 +198,6 @@ def calc_binary(temp, result_df, fold_id, prefix, target, thres, all_df = None, 
 
 def hash(x):
     return hashlib.md5(x.encode()).hexdigest()
-
-#d = {'col1' : [1, 2], 'col2': [3, 4]}
-#df = pd.DataFrame(data=d)
-#df.to_pickle('/gscratch/ark/limill01/clin-bias-summarization/test.pkl')
-#df.to_hdf('/gscratch/ark/limill01/clin-bias-summarization/test.hdf', 'data', mode='w')
-#df = pd.read_hdf('/gscratch/ark/limill01/clin-bias-summarization/test.hdf', 'data')
-#print("here's df:", df)
 
 for folder in os.scandir(args.models_path):
     if (folder.is_dir()) and ((not any([filename.endswith('.xlsx') for filename in os.listdir(folder.path)])) or args.overwrite):

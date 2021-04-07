@@ -62,6 +62,23 @@ if os.path.isfile(os.path.join(args.output_dir, 'preds.pkl')) and not args.overw
     print("File already exists; exiting.")
     sys.exit()
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+n_gpu = torch.cuda.device_count()
+
+seed = args.seed
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+# Other seeds
+os.environ['PYTHONHASHSEED'] = str(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.enabled = False
+
+if n_gpu > 0:
+    torch.cuda.manual_seed_all(seed)
+
 print('Reading dataframe...', flush = True)
 df = pd.read_pickle(args.df_path)
 if 'note_id' in df.columns:
@@ -220,18 +237,26 @@ if args.task_type == 'multiclass':
 if args.use_adversary:
 	discriminator = Discriminator(EMB_SIZE + int(args.fairness_def == 'odds'), args.adv_layers, len(mapping[protected_group]), args.lm)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-n_gpu = torch.cuda.device_count()
 model.to(device)
 if args.use_adversary:
     discriminator.to(device)
 
+'''
 seed = args.seed
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
+
+
+# Other seeds
+os.environ['PYTHONHASHSEED'] = str(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.enabled = False
+
 if n_gpu > 0:
     torch.cuda.manual_seed_all(seed)
+'''
 
 if args.task_type == 'binary':
     criterion = nn.BCELoss()
@@ -262,15 +287,16 @@ def get_embs(generator):
             input_ids = input_ids.to(device)
             segment_ids = segment_ids.to(device)
             input_mask = input_mask.to(device)
-            hidden_states, _ = model(input_ids, token_type_ids = segment_ids, attention_mask = input_mask)
-            bert_out = extract_embeddings(hidden_states, args.emb_method)
 
+            output = model(input_ids, attention_mask = input_mask)
+            hidden_states_last = output[2]
+            hidden_states = output[3]
+            bart_out = extract_embeddings(hidden_states_last, hidden_states, args.emb_method)
             for c,i in enumerate(guid):
                 note_id, seq_id = i.split('-')
-                emb = bert_out[c,:].detach().cpu().numpy()
+                emb = bart_out[c,:].detach().cpu().numpy()
                 features.append(EmbFeature(emb = emb, y = y[c], guid = i, group = group, other_fields= [i[c] for i in other_vars]))
     return features
-
 
 print('Featurizing examples...', flush = True)
 if not args.pregen_emb_path:
@@ -283,14 +309,14 @@ if not args.pregen_emb_path:
     features_test = convert_examples_to_features(examples_test,
                                             Constants.MAX_SEQ_LEN, tokenizer, output_mode = ('regression' if args.task_type == 'regression' else 'classification'))
 
-    training_set = MIMICDataset(features_train, 'train' ,args.task_type)
-    training_generator = data.DataLoader(training_set, shuffle = True,  batch_size = args.train_batch_size, drop_last = True)
+    training_set = MIMICDataset(features_train, 'train', args.task_type)
+    training_generator = data.DataLoader(training_set, shuffle = False,  batch_size = args.train_batch_size, drop_last = True, worker_init_fn=np.random.seed(seed), num_workers=0)
 
     val_set = MIMICDataset(features_eval, 'val', args.task_type)
-    val_generator = data.DataLoader(val_set, shuffle = False,  batch_size = args.train_batch_size)
+    val_generator = data.DataLoader(val_set, shuffle = False,  batch_size = args.train_batch_size, worker_init_fn=np.random.seed(seed), num_workers=0)
 
     test_set = MIMICDataset(features_test, 'test', args.task_type)
-    test_generator = data.DataLoader(test_set, shuffle = False,  batch_size = args.train_batch_size)
+    test_generator = data.DataLoader(test_set, shuffle = False,  batch_size = args.train_batch_size, worker_init_fn=np.random.seed(seed), num_workers=0)
 
 if args.freeze_bart: #only need to precalculate for training and val set
     if args.pregen_emb_path:
@@ -302,9 +328,9 @@ if args.freeze_bart: #only need to precalculate for training and val set
         features_train_embs = get_embs(training_generator)
         features_val_embs = get_embs(val_generator)
         features_test_embs = get_embs(test_generator)
-    training_generator = data.DataLoader(Embdataset(features_train_embs, 'train'), shuffle = True, batch_size = args.train_batch_size, drop_last = True)
-    val_generator = data.DataLoader(Embdataset(features_val_embs, 'val'), shuffle = False,  batch_size = args.train_batch_size)
-    test_generator= data.DataLoader(Embdataset(features_test_embs, 'test'), shuffle = False,  batch_size = args.train_batch_size)
+    training_generator = data.DataLoader(Embdataset(features_train_embs, 'train'), shuffle = False, batch_size = args.train_batch_size, drop_last = False, worker_init_fn=np.random.seed(seed), num_workers=0)
+    val_generator = data.DataLoader(Embdataset(features_val_embs, 'val'), shuffle = False,  batch_size = args.train_batch_size, worker_init_fn=np.random.seed(seed), num_workers=0)
+    test_generator= data.DataLoader(Embdataset(features_test_embs, 'test'), shuffle = False,  batch_size = args.train_batch_size, worker_init_fn=np.random.seed(seed), num_workers=0)
 
 num_train_epochs = args.max_num_epochs
 learning_rate = args.lr
@@ -371,17 +397,19 @@ def evaluate_on_set(generator, predictor, emb_gen = False, c_val=2):
         with torch.no_grad():
             for input_ids, input_mask, segment_ids, y, group, guid, other_vars in generator:
                 input_ids = input_ids.to(device)
-                segment_ids = segment_ids.to(device)
+                #segment_ids = segment_ids.to(device)
                 input_mask = input_mask.to(device)
                 y = y.to(device)
                 group = group.to(device)
-                hidden_states, _ = model(input_ids, token_type_ids = segment_ids, attention_mask = input_mask)
-                bert_out = extract_embeddings(hidden_states, args.emb_method)
 
+                output = model(input_ids, attention_mask = input_mask)
+                hidden_states_last = output[2]
+                hidden_states = output[3]
+                bart_out = extract_embeddings(hidden_states_last, hidden_states, args.emb_method)
                 for i in other_vars:
-                    bert_out = torch.cat([bert_out, i.float().unsqueeze(dim = 1).to(device)], 1)
+                    bart_out = torch.cat([bart_out, i.float().unsqueeze(dim = 1).to(device)], 1)
 
-                preds = predictor(bert_out).detach().cpu()
+                preds = predictor(bart_out).detach().cpu()
 
                 for c,i in enumerate(guid):
                     note_id, seq_id = i.split('-')
@@ -389,7 +417,7 @@ def evaluate_on_set(generator, predictor, emb_gen = False, c_val=2):
                         prediction_dict[note_id][int(seq_id)] = preds[c].item()
                     else:
                         prediction_dict[note_id][int(seq_id)] = preds[c,:].numpy()
-                    embs[note_id][int(seq_id), :] = bert_out[c,:EMB_SIZE].detach().cpu().numpy()
+                    embs[note_id][int(seq_id), :] = bart_out[c,:EMB_SIZE].detach().cpu().numpy()
 
 
     merged_preds = merge_preds(prediction_dict, c_val)
@@ -433,7 +461,7 @@ for predictor_params in grid:
                 ]
     '''
     params = [p for n,p in model.named_parameters()]
-    optimizer = AdamW(params, lr=args.learning_rate)
+    optimizer = AdamW(params, lr=learning_rate)
 
     es = EarlyStopping(patience = args.es_patience)
 
@@ -558,10 +586,10 @@ for predictor_params in grid:
                     output = model(input_ids, attention_mask = input_mask)
                     hidden_states_last = output[2]
                     hidden_states = output[3]
-                    bert_out = extract_embeddings(hidden_states_last, hidden_states, args.emb_method)
+                    bart_out = extract_embeddings(hidden_states_last, hidden_states, args.emb_method)
 
                     for i in other_vars:
-                        bart_out = torch.cat([bert_out, i.float().unsqueeze(dim = 1).to(device)], 1)
+                        bart_out = torch.cat([bart_out, i.float().unsqueeze(dim = 1).to(device)], 1)
 
                     preds = predictor(bart_out)
                     loss = criterion(preds, y)
